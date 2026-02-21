@@ -10,12 +10,10 @@
  * Dependencies: express (only). Everything else is Node.js built-in.
  */
 
-"use strict";
-
-const http = require("http");
-const { URL } = require("url");
-const crypto = require("crypto");
-const express = require("express");
+import http from "http";
+import { URL } from "url";
+import crypto from "crypto";
+import express from "express";
 
 /* ----------------------------- Configuration ----------------------------- */
 
