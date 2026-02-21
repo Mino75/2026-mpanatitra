@@ -1,13 +1,11 @@
 /**
- * server.js — Minimal production-ready HTTP forward proxy (Express-only dependency)
+ * server.js — HTTP forward proxy (Express-only dependency)
  *
- * Behavior:
- * - Accepts incoming HTTP requests.
- * - Authorizes caller by:
- *   1) API key (header/query) AND
- *   2) Source domain match (Origin/Referer/X-Source-Domain)
- * - Forwards the request to TARGET_BASE_URL, preserving method/path/query/body.
- * - Adds Basic Auth header (user/pass from env) to the outgoing request.
+ * Core:
+ * - Accepts incoming HTTP requests (typically behind Traefik).
+ * - Authorizes caller by API key, and optionally by source domain allowlist.
+ * - Forwards request to TARGET_BASE_URL over HTTP, preserving method/path/query/body.
+ * - Injects Basic Auth on outbound request (credentials from env).
  *
  * Dependencies: express (only). Everything else is Node.js built-in.
  */
@@ -44,41 +42,45 @@ function parseBoolEnv(name, def = "false") {
 }
 
 function normalizeHost(host) {
-  // Accept "example.com" or "example.com:1234" and normalize to hostname only
   if (!host) return "";
   try {
-    // If host already has scheme, URL will parse; otherwise prepend.
     const u = host.includes("://") ? new URL(host) : new URL(`http://${host}`);
     return (u.hostname || "").toLowerCase();
   } catch {
-    // Fallback: strip port manually
     return host.split(":")[0].toLowerCase();
   }
 }
 
 const PORT = Number(process.env.PORT || "8080");
-const TRUST_PROXY = parseBoolEnv("TRUST_PROXY", "true"); // if behind ingress/reverse proxy
-const TARGET_BASE_URL = mustGetEnv("TARGET_BASE_URL"); // e.g. "http://upstream.internal:9000"
+const TRUST_PROXY = parseBoolEnv("TRUST_PROXY", "true");
+
+// Upstream (internal service call)
+const TARGET_BASE_URL = mustGetEnv("TARGET_BASE_URL"); // must be http://service:port (internal)
 const BASIC_AUTH_USER = mustGetEnv("BASIC_AUTH_USER");
 const BASIC_AUTH_PASS = mustGetEnv("BASIC_AUTH_PASS");
 
 // Authorization inputs
-const AUTHORIZED_SITES = parseCsvEnv("AUTHORIZED_SITES"); // e.g. "app.example.com,admin.example.com"
-const AUTHORIZED_API_KEYS = parseCsvEnv("AUTHORIZED_API_KEYS"); // e.g. "k1,k2,k3"
+const AUTHORIZED_API_KEYS = parseCsvEnv("AUTHORIZED_API_KEYS"); // CSV of allowed keys
 
-// Where to read API key from the inbound request
-const API_KEY_HEADER = (process.env.API_KEY_HEADER || "x-api-key").toLowerCase(); // inbound header name
-const API_KEY_QUERY_PARAM = process.env.API_KEY_QUERY_PARAM || "api_key"; // inbound query param name
-
-// Optional: require a specific explicit header for source domain instead of Origin/Referer
+// Optional source allowlist (NOT a strong security boundary; enable only if it matches your use-case)
+const ENFORCE_SITE_ALLOWLIST = parseBoolEnv("ENFORCE_SITE_ALLOWLIST", "false");
+const AUTHORIZED_SITES = parseCsvEnv("AUTHORIZED_SITES"); // CSV of allowed hostnames
 const SOURCE_DOMAIN_HEADER = (process.env.SOURCE_DOMAIN_HEADER || "x-source-domain").toLowerCase();
 
-// Proxy behavior tuning
-const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || String(10 * 1024 * 1024)); // 10 MB default
+// Where to read API key from inbound request
+const API_KEY_HEADER = (process.env.API_KEY_HEADER || "x-api-key").toLowerCase();
+const API_KEY_QUERY_PARAM = process.env.API_KEY_QUERY_PARAM || "api_key";
+const ALLOW_API_KEY_IN_QUERY = parseBoolEnv("ALLOW_API_KEY_IN_QUERY", "false"); // default OFF (avoid leaking keys in logs)
+
+// Proxy tuning
+const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || String(10 * 1024 * 1024)); // 10 MB
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || "15000");
 const SERVER_TIMEOUT_MS = Number(process.env.SERVER_TIMEOUT_MS || "16000");
 
-// Optional header allowlist/denylist (defaults are safe)
+const FORWARD_CLIENT_IP = parseBoolEnv("FORWARD_CLIENT_IP", "true");
+const LOG_STARTUP = parseBoolEnv("LOG_STARTUP", "true");
+
+// Strip hop-by-hop and sensitive headers from inbound before forwarding
 const STRIP_INBOUND_HEADERS = new Set(
   parseCsvEnv(
     "STRIP_INBOUND_HEADERS",
@@ -92,12 +94,10 @@ const STRIP_INBOUND_HEADERS = new Set(
       "transfer-encoding",
       "upgrade",
       "host",
-      "authorization", // do not let caller control outbound auth
+      "authorization", // caller must not control outbound auth
     ].join(",")
   ).map((h) => h.toLowerCase())
 );
-
-const FORWARD_CLIENT_IP = parseBoolEnv("FORWARD_CLIENT_IP", "true"); // adds X-Forwarded-For
 
 /* ------------------------------ Initialization --------------------------- */
 
@@ -105,7 +105,7 @@ const app = express();
 app.disable("x-powered-by");
 if (TRUST_PROXY) app.set("trust proxy", true);
 
-// Capture raw body as Buffer for any content-type
+// Capture raw body as Buffer for any content-type (single dependency constraint)
 app.use(
   express.raw({
     type: () => true,
@@ -115,13 +115,13 @@ app.use(
 
 const target = new URL(TARGET_BASE_URL);
 if (target.protocol !== "http:") {
-  throw new Error("TARGET_BASE_URL must be http:// (HTTP only).");
+  throw new Error("TARGET_BASE_URL must be http:// (internal service call).");
 }
 
 const basicAuthValue =
   "Basic " + Buffer.from(`${BASIC_AUTH_USER}:${BASIC_AUTH_PASS}`, "utf8").toString("base64");
 
-// Keep-alive for upstream performance (Node built-in)
+// Keep-alive for upstream performance
 const upstreamAgent = new http.Agent({
   keepAlive: true,
   maxSockets: Number(process.env.UPSTREAM_MAX_SOCKETS || "100"),
@@ -129,7 +129,6 @@ const upstreamAgent = new http.Agent({
 });
 
 function timingSafeEquals(a, b) {
-  // Prevent trivial timing attacks on API key compares
   const ba = Buffer.from(String(a || ""), "utf8");
   const bb = Buffer.from(String(b || ""), "utf8");
   if (ba.length !== bb.length) return false;
@@ -145,8 +144,11 @@ function getProvidedApiKey(req) {
   const headerVal = req.headers[API_KEY_HEADER];
   if (typeof headerVal === "string" && headerVal.trim()) return headerVal.trim();
 
-  const q = req.query?.[API_KEY_QUERY_PARAM];
-  if (typeof q === "string" && q.trim()) return q.trim();
+  if (ALLOW_API_KEY_IN_QUERY) {
+    const q = req.query?.[API_KEY_QUERY_PARAM];
+    if (typeof q === "string" && q.trim()) return q.trim();
+    if (Array.isArray(q) && typeof q[0] === "string" && q[0].trim()) return q[0].trim();
+  }
 
   return "";
 }
@@ -172,7 +174,6 @@ function isSiteAuthorized(sourceDomain) {
   if (!AUTHORIZED_SITES.length) return false;
   const d = normalizeHost(sourceDomain);
   if (!d) return false;
-  // Exact match by default; if you need wildcard semantics, encode explicitly upstream.
   return AUTHORIZED_SITES.map((s) => normalizeHost(s)).includes(d);
 }
 
@@ -191,6 +192,15 @@ function buildUpstreamHeaders(req) {
   // Set host to upstream host
   headers["host"] = target.host;
 
+  // Ensure content-length matches the actual buffered body we send
+  if (req.body && Buffer.isBuffer(req.body)) {
+    if (req.body.length > 0) {
+      headers["content-length"] = String(req.body.length);
+    } else {
+      delete headers["content-length"];
+    }
+  }
+
   // Optionally forward client IP chain
   if (FORWARD_CLIENT_IP) {
     const existing = req.headers["x-forwarded-for"];
@@ -204,8 +214,7 @@ function buildUpstreamHeaders(req) {
 }
 
 function upstreamRequestOptions(req) {
-  // Preserve full path including query string.
-  const url = new URL(req.originalUrl, "http://proxy.local"); // just to normalize
+  const url = new URL(req.originalUrl, "http://proxy.local");
   const pathWithQuery = url.pathname + url.search;
 
   return {
@@ -226,21 +235,25 @@ app.get("/healthz", (req, res) => {
   res.status(200).type("text/plain").send("ok");
 });
 
-// Proxy all remaining routes
 app.all("*", (req, res) => {
   const providedKey = getProvidedApiKey(req);
-  const sourceDomain = getSourceDomain(req);
 
-  if (!isApiKeyAuthorized(providedKey) || !isSiteAuthorized(sourceDomain)) {
-    // Do not leak which condition failed
+  if (!isApiKeyAuthorized(providedKey)) {
     res.status(403).json({ error: "forbidden" });
     return;
+  }
+
+  if (ENFORCE_SITE_ALLOWLIST) {
+    const sourceDomain = getSourceDomain(req);
+    if (!isSiteAuthorized(sourceDomain)) {
+      res.status(403).json({ error: "forbidden" });
+      return;
+    }
   }
 
   const opts = upstreamRequestOptions(req);
 
   const upstreamReq = http.request(opts, (upstreamRes) => {
-    // Copy status and headers (strip hop-by-hop)
     res.status(upstreamRes.statusCode || 502);
 
     for (const [k, v] of Object.entries(upstreamRes.headers)) {
@@ -260,6 +273,7 @@ app.all("*", (req, res) => {
       if (typeof v !== "undefined") res.setHeader(k, v);
     }
 
+    // Stream response back
     upstreamRes.pipe(res);
   });
 
@@ -272,7 +286,7 @@ app.all("*", (req, res) => {
     res.json({ error: "bad_gateway" });
   });
 
-  // Write body (Buffer from express.raw); for GET/HEAD it will be empty buffer.
+  // Write body (Buffer from express.raw)
   if (req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
     upstreamReq.write(req.body);
   }
@@ -286,22 +300,22 @@ server.requestTimeout = SERVER_TIMEOUT_MS;
 server.headersTimeout = SERVER_TIMEOUT_MS;
 
 server.listen(PORT, "0.0.0.0", () => {
-  // Avoid noisy logs by default; enable if desired
-  if (parseBoolEnv("LOG_STARTUP", "true")) {
+  if (LOG_STARTUP) {
     // eslint-disable-next-line no-console
     console.log(
       JSON.stringify({
         msg: "proxy_started",
         port: PORT,
         target: TARGET_BASE_URL,
-        authorized_sites_count: AUTHORIZED_SITES.length,
         authorized_keys_count: AUTHORIZED_API_KEYS.length,
+        enforce_site_allowlist: ENFORCE_SITE_ALLOWLIST,
+        authorized_sites_count: AUTHORIZED_SITES.length,
+        allow_api_key_in_query: ALLOW_API_KEY_IN_QUERY,
       })
     );
   }
 });
 
-// Graceful shutdown
 function shutdown(signal) {
   // eslint-disable-next-line no-console
   console.error(JSON.stringify({ msg: "shutdown", signal }));
@@ -309,7 +323,6 @@ function shutdown(signal) {
     upstreamAgent.destroy();
     process.exit(0);
   });
-  // Hard stop
   setTimeout(() => process.exit(1), 5000).unref();
 }
 
