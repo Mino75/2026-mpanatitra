@@ -4,6 +4,7 @@
  * Core:
  * - Accepts incoming HTTP requests (typically behind Traefik).
  * - Authorizes caller by API key, and optionally by source domain allowlist.
+ * - Handles browser CORS + preflight (OPTIONS) so fetch() works reliably.
  * - Forwards request to TARGET_BASE_URL over HTTP, preserving method/path/query/body.
  * - Injects Basic Auth on outbound request (credentials from env).
  *
@@ -26,7 +27,7 @@ function mustGetEnv(name) {
 }
 
 function parseCsvEnv(name, def = "") {
-  const raw = (process.env[name] ?? def).trim();
+  const raw = String(process.env[name] ?? def).trim();
   if (!raw) return [];
   return raw
     .split(",")
@@ -68,15 +69,24 @@ const SOURCE_DOMAIN_HEADER = (process.env.SOURCE_DOMAIN_HEADER || "x-source-doma
 // Where to read API key from inbound request
 const API_KEY_HEADER = (process.env.API_KEY_HEADER || "x-api-key").toLowerCase();
 const API_KEY_QUERY_PARAM = process.env.API_KEY_QUERY_PARAM || "api_key";
-const ALLOW_API_KEY_IN_QUERY = parseBoolEnv("ALLOW_API_KEY_IN_QUERY", "false"); // default OFF (avoid leaking keys in logs)
+const ALLOW_API_KEY_IN_QUERY = parseBoolEnv("ALLOW_API_KEY_IN_QUERY", "false"); // default OFF
 
 // Proxy tuning
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || String(10 * 1024 * 1024)); // 10 MB
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || "15000");
 const SERVER_TIMEOUT_MS = Number(process.env.SERVER_TIMEOUT_MS || "16000");
+const UPSTREAM_MAX_SOCKETS = Number(process.env.UPSTREAM_MAX_SOCKETS || "100");
 
+// Forwarding / logging
 const FORWARD_CLIENT_IP = parseBoolEnv("FORWARD_CLIENT_IP", "true");
 const LOG_STARTUP = parseBoolEnv("LOG_STARTUP", "true");
+const LOG_REQUESTS = parseBoolEnv("LOG_REQUESTS", "false");
+
+// CORS (for browser fetch)
+const CORS_ENABLED = parseBoolEnv("CORS_ENABLED", "true");
+const CORS_ALLOW_ORIGINS = parseCsvEnv("CORS_ALLOW_ORIGINS", "*"); // "*" or CSV of exact origins
+const CORS_ALLOW_CREDENTIALS = parseBoolEnv("CORS_ALLOW_CREDENTIALS", "false");
+const CORS_MAX_AGE_SECONDS = Number(process.env.CORS_MAX_AGE_SECONDS || "600");
 
 // Strip hop-by-hop and sensitive headers from inbound before forwarding
 const STRIP_INBOUND_HEADERS = new Set(
@@ -122,9 +132,11 @@ const basicAuthValue =
 // Keep-alive for upstream performance
 const upstreamAgent = new http.Agent({
   keepAlive: true,
-  maxSockets: Number(process.env.UPSTREAM_MAX_SOCKETS || "100"),
+  maxSockets: UPSTREAM_MAX_SOCKETS,
   timeout: UPSTREAM_TIMEOUT_MS,
 });
+
+/* ------------------------------ Helpers ---------------------------------- */
 
 function timingSafeEquals(a, b) {
   const ba = Buffer.from(String(a || ""), "utf8");
@@ -181,20 +193,74 @@ function isSiteAuthorized(sourceDomain) {
     if (rule.startsWith("*.")) {
       const base = rule.slice(2);
       if (!base) return false;
-
-      // allow subdomains only (a.b.example.com) and also commonly desired: direct domain match
       return d === base || d.endsWith("." + base);
     }
 
-    // Also allow plain domain to match itself and any subdomain (future-proof)
-    // If you want "exact only", remove the endsWith line.
+    // Plain domain matches itself and any subdomain
     if (d === rule) return true;
     return d.endsWith("." + rule);
   });
 }
 
+/* ------------------------------ CORS ------------------------------------- */
+
+function isOriginAllowed(origin) {
+  if (!origin) return false;
+  if (CORS_ALLOW_ORIGINS.includes("*")) return true;
+  return CORS_ALLOW_ORIGINS.includes(origin);
+}
+
+function setCorsHeaders(req, res) {
+  if (!CORS_ENABLED) return;
+
+  const origin = typeof req.headers.origin === "string" ? req.headers.origin.trim() : "";
+
+  // If credentials are used, Access-Control-Allow-Origin cannot be "*"
+  if (CORS_ALLOW_ORIGINS.includes("*") && !CORS_ALLOW_CREDENTIALS) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (origin && isOriginAllowed(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+
+  // Allow the headers that browsers commonly preflight for fetch
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    [
+      "content-type",
+      "accept",
+      "x-api-key",
+      "x-source-domain",
+      "x-requested-with",
+      "authorization", // even if stripped inbound, the browser may request it in preflight
+    ].join(", ")
+  );
+
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Max-Age", String(CORS_MAX_AGE_SECONDS));
+
+  if (CORS_ALLOW_CREDENTIALS) {
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
+}
+
+// Apply CORS headers for all responses (including errors)
+app.use((req, res, next) => {
+  setCorsHeaders(req, res);
+  next();
+});
+
+// Fast preflight response
+app.options("*", (req, res) => {
+  // CORS headers already set by middleware above
+  res.status(204).end();
+});
+
+/* ------------------------------ Forwarding ------------------------------- */
+
 function buildUpstreamHeaders(req) {
   const headers = {};
+
   for (const [k, v] of Object.entries(req.headers)) {
     const key = k.toLowerCase();
     if (STRIP_INBOUND_HEADERS.has(key)) continue;
@@ -217,19 +283,28 @@ function buildUpstreamHeaders(req) {
     }
   }
 
-  // Optionally forward client IP chain
+  // Optionally forward client IP chain + correct proto
   if (FORWARD_CLIENT_IP) {
     const existing = req.headers["x-forwarded-for"];
     const clientIp = req.ip;
     const chain = [existing, clientIp].filter(Boolean).join(", ");
     if (chain) headers["x-forwarded-for"] = chain;
-    headers["x-forwarded-proto"] = "http";
+
+    // Use Express protocol (respects trust proxy setting)
+    headers["x-forwarded-proto"] = req.protocol || (req.secure ? "https" : "http");
+
+    // Forward original host if present
+    const xfHost = req.headers["x-forwarded-host"];
+    if (typeof xfHost === "string" && xfHost.trim()) {
+      headers["x-forwarded-host"] = xfHost.trim();
+    }
   }
 
   return headers;
 }
 
 function upstreamRequestOptions(req) {
+  // Preserve original path + query (req.originalUrl includes both)
   const url = new URL(req.originalUrl, "http://proxy.local");
   const pathWithQuery = url.pathname + url.search;
 
@@ -251,7 +326,20 @@ app.get("/healthz", (req, res) => {
   res.status(200).type("text/plain").send("ok");
 });
 
+// Main proxy route
 app.all("*", (req, res) => {
+  if (LOG_REQUESTS) {
+    // eslint-disable-next-line no-console
+    console.log(
+      JSON.stringify({
+        msg: "inbound_request",
+        method: req.method,
+        url: req.originalUrl,
+        origin: req.headers.origin,
+      })
+    );
+  }
+
   const providedKey = getProvidedApiKey(req);
 
   if (!isApiKeyAuthorized(providedKey)) {
@@ -272,6 +360,7 @@ app.all("*", (req, res) => {
   const upstreamReq = http.request(opts, (upstreamRes) => {
     res.status(upstreamRes.statusCode || 502);
 
+    // Copy upstream headers except hop-by-hop
     for (const [k, v] of Object.entries(upstreamRes.headers)) {
       const key = k.toLowerCase();
       if (
@@ -289,7 +378,6 @@ app.all("*", (req, res) => {
       if (typeof v !== "undefined") res.setHeader(k, v);
     }
 
-    // Stream response back
     upstreamRes.pipe(res);
   });
 
@@ -297,7 +385,18 @@ app.all("*", (req, res) => {
     upstreamReq.destroy(new Error("Upstream timeout"));
   });
 
-  upstreamReq.on("error", () => {
+  upstreamReq.on("error", (err) => {
+    if (LOG_REQUESTS) {
+      // eslint-disable-next-line no-console
+      console.error(
+        JSON.stringify({
+          msg: "upstream_error",
+          method: req.method,
+          url: req.originalUrl,
+          error: String(err?.message || err),
+        })
+      );
+    }
     if (!res.headersSent) res.status(502);
     res.json({ error: "bad_gateway" });
   });
@@ -327,6 +426,9 @@ server.listen(PORT, "0.0.0.0", () => {
         enforce_site_allowlist: ENFORCE_SITE_ALLOWLIST,
         authorized_sites_count: AUTHORIZED_SITES.length,
         allow_api_key_in_query: ALLOW_API_KEY_IN_QUERY,
+        cors_enabled: CORS_ENABLED,
+        cors_allow_origins: CORS_ALLOW_ORIGINS,
+        cors_allow_credentials: CORS_ALLOW_CREDENTIALS,
       })
     );
   }
