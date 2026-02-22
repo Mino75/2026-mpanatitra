@@ -170,9 +170,27 @@ function getSourceDomain(req) {
 
 function isSiteAuthorized(sourceDomain) {
   if (!AUTHORIZED_SITES.length) return false;
+
   const d = normalizeHost(sourceDomain);
   if (!d) return false;
-  return AUTHORIZED_SITES.map((s) => normalizeHost(s)).includes(d);
+
+  const allowed = AUTHORIZED_SITES.map((s) => String(s || "").trim().toLowerCase()).filter(Boolean);
+
+  return allowed.some((rule) => {
+    // Support rules like "*.example.com"
+    if (rule.startsWith("*.")) {
+      const base = rule.slice(2);
+      if (!base) return false;
+
+      // allow subdomains only (a.b.example.com) and also commonly desired: direct domain match
+      return d === base || d.endsWith("." + base);
+    }
+
+    // Also allow plain domain to match itself and any subdomain (future-proof)
+    // If you want "exact only", remove the endsWith line.
+    if (d === rule) return true;
+    return d.endsWith("." + rule);
+  });
 }
 
 function buildUpstreamHeaders(req) {
