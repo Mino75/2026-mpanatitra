@@ -1,6 +1,6 @@
 # mpanatitra-proxy 🔁
 
-A minimal HTTP forward proxy built on Express. It sits between a client (browser or service) and an internal service, handling authentication, CORS, and request forwarding.
+Mpanatitra or Carrier in Malagasy is A minimal HTTP forward proxy built on Express. It sits between a client (browser or service) and an internal service, handling authentication, CORS, and request forwarding.
 
 ---
 
